@@ -1,0 +1,1056 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RTSP Cam</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box;  }
+    /* This window is chrome, not a document - nothing here is text the user
+       would want to select, and stray highlights look broken on an overlay. */
+    html {
+      user-select: none;
+      -webkit-user-select: none;
+    }
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: transparent;
+    }
+    body {
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    #container {
+      position: relative;
+      width: 100%;
+      height: 100%;
+      background: #000;
+      border-radius: 8px;
+      overflow: hidden;
+      filter: drop-shadow(0 7px 20px rgba(0, 0, 0, 0.65));
+      /* Dragging is implemented in JS (see "Drag to move" below) rather than
+         with -webkit-app-region. An OS drag region is resolved geometrically
+         and ignores z-index, so a full-window one swallows clicks meant for
+         the controls and the camera menu on top of it. */
+      -webkit-app-region: no-drag;
+      cursor: default;
+    }
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      transition: opacity 0.2s;
+    }
+    /* See-through mode: fade the picture and drop the opaque backing so the
+       desktop shows through. The controls keep full opacity, otherwise the
+       button that turns this off would be hard to find. */
+    #container.see-through {
+      background: transparent;
+      filter: none;
+    }
+    /* The window itself is faded by the OS (setOpacity), so the canvas stays
+       fully opaque here - fading both would multiply and leave the picture
+       barely visible. */
+    /* Everything is already faded by the window's own opacity, so the controls
+       keep their solid backgrounds - thinning them further would leave them
+       hard to read against whatever is behind the window. */
+    /* Overlay controls - visible on hover */
+    #overlay {
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      /* Above the status message, so the close button stays reachable even
+         when the stream is down. */
+      z-index: 2;
+      padding: 6px 10px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      opacity: 0;
+      transition: opacity 0.2s;
+      background: linear-gradient(to bottom, rgba(0,0,0,0.6), transparent);
+      /* Dragging is handled in JS, so no OS drag region is needed here. */
+      -webkit-app-region: no-drag;
+    }
+    #container:hover #overlay {
+      opacity: 1;
+    }
+    /* With no picture to show, keep the controls visible rather than
+       hidden behind a hover the user has no reason to try. */
+    #container.no-stream #overlay {
+      opacity: 1;
+    }
+    /* The dropdown hangs below the control bar, so the bar must stay put
+       while the menu is open - otherwise moving toward the menu leaves the
+       hover area and dismisses it. */
+    #container.menu-open #overlay {
+      opacity: 1;
+    }
+    /* Camera picker: the label doubles as the switcher trigger */
+    #camera-picker {
+      position: relative;
+      -webkit-app-region: no-drag;
+    }
+    /* Controls for this view - z-order, pop out, remove - sit beside the
+       picker. Whole-app actions stay grouped on the right. */
+    #overlay .camera-actions {
+      display: flex;
+      gap: 4px;
+      margin-right: auto;
+      margin-left: 6px;
+      -webkit-app-region: no-drag;
+    }
+    #camera-button {
+      -webkit-app-region: no-drag;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      border: none;
+      border-radius: 4px;
+      background: rgba(255,255,255,0.15);
+      color: #fff;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: 11px;
+      font-weight: 500;
+      padding: 4px 7px;
+      cursor: pointer;
+      max-width: 190px;
+    }
+    #camera-button:hover { background: rgba(255,255,255,0.3); }
+    #camera-button .caret { opacity: 0.7; flex-shrink: 0; }
+    #camera-button .current {
+      flex: 0 1 auto;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    /* The caret stays even with one camera: the menu is still there, holding
+       "Manage cameras…", and without it the control does not read as a menu. */
+
+    #camera-menu {
+      position: absolute;
+      top: calc(100% + 4px);
+      left: 0;
+      min-width: 160px;
+      max-width: 240px;
+      max-height: 220px;
+      overflow-y: auto;
+      padding: 4px;
+      border-radius: 6px;
+      background: rgba(24,24,28,0.97);
+      box-shadow: 0 6px 20px rgba(0,0,0,0.5);
+      display: none;
+      flex-direction: column;
+      gap: 2px;
+      z-index: 3;
+    }
+    #camera-menu.open { display: flex; }
+    /* The menu renders below the control bar, over the draggable container.
+       app-region does not inherit, so it must opt out of dragging itself or
+       Windows treats it as title bar and eats every click. */
+    #camera-menu,
+    #camera-menu button {
+      -webkit-app-region: no-drag;
+    }
+    #camera-menu button {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      width: 100%;
+      height: auto;
+      justify-content: flex-start;
+      padding: 6px 8px;
+      border: none;
+      border-radius: 4px;
+      background: transparent;
+      color: #e8e8ea;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: 11px;
+      text-align: left;
+      cursor: pointer;
+    }
+    #camera-menu button:hover { background: rgba(255,255,255,0.14); }
+    #camera-menu button .tick { width: 10px; flex-shrink: 0; opacity: 0; }
+    #camera-menu button.active .tick { opacity: 1; }
+    /* The gear marks an action rather than a selection, so it is always shown
+       - dimmed, so it does not compete with the checkmark. */
+    #camera-menu button .tick.gear { opacity: 0.65; }
+    #camera-menu button .cam-name {
+      /* Claim the row's remaining width; without this the span collapses to
+         zero and the name renders blank. */
+      flex: 1 1 auto;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    #camera-menu .divider {
+      height: 1px;
+      margin: 3px 2px;
+      background: rgba(255,255,255,0.12);
+    }
+    #overlay .buttons {
+      display: flex;
+      gap: 4px;
+      -webkit-app-region: no-drag;
+    }
+    /* Icon buttons in the control bar and the floating snapshot button - not
+       the camera menu, which defines its own full-width rows. */
+    #overlay .buttons button,
+    #overlay .camera-actions button,
+    #btn-snapshot {
+      -webkit-app-region: no-drag;
+      width: 24px;
+      height: 24px;
+      border: none;
+      border-radius: 4px;
+      background: rgba(255,255,255,0.15);
+      color: #fff;
+      font-size: 13px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      line-height: 1;
+    }
+    #overlay .buttons button:hover,
+    #overlay .camera-actions button:hover,
+    #btn-snapshot:hover {
+      background: rgba(255,255,255,0.3);
+    }
+    /* Snapshot floats in the bottom-left, revealed with the other controls. */
+    #btn-snapshot {
+      position: absolute;
+      bottom: 8px;
+      left: 10px;
+      z-index: 2;
+      opacity: 0;
+      transition: opacity 0.2s;
+    }
+    #container:hover #btn-snapshot,
+    #container.no-stream #btn-snapshot,
+    #container.menu-open #btn-snapshot {
+      opacity: 1;
+    }
+    /* Status dot */
+    /* Connection state, inside the camera button ahead of the name. Spacing
+       comes from the button's own flex gap. */
+    #status-dot {
+      width: 7px;
+      height: 7px;
+      flex-shrink: 0;
+      margin-right: 1px;
+      border-radius: 50%;
+      background: #f44336;
+      transition: background 0.2s;
+    }
+    #status-dot.connected {
+      background: #4caf50;
+    }
+    /* Connection / setup message shown instead of a blank canvas */
+    #message {
+      position: absolute;
+      inset: 0;
+      z-index: 1;
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      /* Extra top padding keeps the text clear of the control bar. */
+      padding: 40px 20px 20px;
+      text-align: center;
+      background: #14141a;
+      color: #e8e8ea;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: 12px;
+      /* Dragged in JS along with the rest of the window body. */
+      -webkit-app-region: no-drag;
+    }
+    #message.show { display: flex; }
+    #message .headline { font-weight: 600; font-size: 13px; }
+    #message .detail { color: #a0a0a8; max-width: 90%; line-height: 1.45; }
+    #message button {
+      -webkit-app-region: no-drag;
+      padding: 6px 14px;
+      border: none;
+      border-radius: 5px;
+      background: #4c93f0;
+      color: #08131f;
+      font-size: 12px;
+      font-weight: 600;
+      font-family: inherit;
+      cursor: pointer;
+    }
+    #message .row { display: flex; gap: 8px; }
+    #message .row button.secondary { background: rgba(255,255,255,0.16); color: #e8e8ea; }
+  </style>
+</head>
+<body>
+  <div id="container">
+    <canvas id="canvas"></canvas>
+    <div id="overlay">
+      <div id="camera-picker">
+        <button id="camera-button" title="Switch camera">
+          <span id="status-dot"></span>
+          <span class="current">CAM</span>
+          <svg class="caret" xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+        </button>
+        <div id="camera-menu"></div>
+      </div>
+      <div class="camera-actions">
+        <button id="btn-pin" title="Window: top"><svg id="pin-icon" xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17v5"/><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z"/></svg></button>
+        <button id="btn-transparent" title="See-through: off"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0"/><circle cx="12" cy="12" r="3"/></svg></button>
+        <button id="btn-popout" title="Open in new window"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg></button>
+        <button id="btn-dismiss" title="Remove this window"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 11v6"/><path d="M14 11v6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg></button>
+      </div>
+      <div class="buttons">
+        <button id="btn-minimize" title="Minimize"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/></svg></button>
+        <button id="btn-close" title="Quit and save all windows (Esc)"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg></button>
+      </div>
+    </div>
+    <div id="message">
+      <div class="headline" id="message-headline"></div>
+      <div class="detail" id="message-detail"></div>
+      <div class="row">
+        <button id="message-action"></button>
+        <button id="message-retry" class="secondary" style="display:none">Retry</button>
+      </div>
+    </div>
+    <button id="btn-snapshot" title="Snapshot"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13.997 4a2 2 0 0 1 1.76 1.05l.486.9A2 2 0 0 0 18.003 7H20a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2h1.997a2 2 0 0 0 1.759-1.048l.489-.904A2 2 0 0 1 10.004 4z"/><circle cx="12" cy="13" r="3"/></svg></button>
+  </div>
+
+  <script>
+    const canvas = document.getElementById("canvas");
+    const container = document.getElementById("container");
+    const statusDot = document.getElementById("status-dot");
+    const ctx = canvas.getContext("2d");
+
+    // Which camera this window shows, and whether it is a pop-out. Set from
+    // the main process before the socket connects.
+    let viewCameraId = null;
+    let isPopout = false;
+    let wsPort = 9999;
+
+    // Hover-raise is driven by real cursor position in the main process;
+    // DOM mouseenter/mouseleave proved too unreliable for window z-order.
+
+    // --- Drag to move ------------------------------------------------------
+    // Implemented here rather than with -webkit-app-region so the whole video
+    // can move the window without the OS drag region swallowing clicks meant
+    // for the controls or the camera menu drawn on top of it.
+
+    let dragging = false;
+    let grabPoint = null;
+
+    // The total offset from the grab point is sent each time, and the main
+    // process places the window absolutely from the position it had when the
+    // drag began. Incremental repositioning accumulates rounding error on
+    // scaled displays and makes the window grow as it moves.
+    function beginDrag(event) {
+      if (event.button !== 0) return;
+      // Anything interactive handles its own clicks.
+      if (event.target.closest("button, a, input, select, #camera-menu")) {
+        return;
+      }
+      dragging = true;
+      // Screen coordinates do not shift as the window moves under the pointer.
+      grabPoint = { x: event.screenX, y: event.screenY };
+      if (window.electronAPI) window.electronAPI.dragStart();
+      event.preventDefault();
+    }
+
+    function moveDrag(event) {
+      if (!dragging) return;
+      // No button held means the release was missed (e.g. outside the window).
+      if (event.buttons === 0) {
+        endDrag();
+        return;
+      }
+      const dx = event.screenX - grabPoint.x;
+      const dy = event.screenY - grabPoint.y;
+      if (window.electronAPI) window.electronAPI.dragWindow(dx, dy);
+    }
+
+    function endDrag() {
+      if (!dragging) return;
+      dragging = false;
+      grabPoint = null;
+      if (window.electronAPI) window.electronAPI.dragEnd();
+    }
+
+    // Mouse events are used rather than pointer events: they are what the
+    // frameless window reliably delivers here.
+    document.addEventListener("mousedown", beginDrag);
+    document.addEventListener("mousemove", moveDrag);
+    document.addEventListener("mouseup", endDrag);
+    // A drag that ends outside the window still has to stop.
+    window.addEventListener("blur", endDrag);
+
+    // --- H.264 playback via WebCodecs ---------------------------------------
+    // The camera's native H.264 is passed through untouched by ffmpeg and
+    // decoded here in hardware, so there is no transcode to introduce
+    // artifacts.
+
+    const NAL_SPS = 7;
+    const NAL_IDR = 5;
+
+    let decoder = null;
+    // A decoder can only start on a keyframe; frames before the first one are
+    // undecodable and must be dropped rather than queued.
+    let waitingForKeyframe = true;
+
+    // Timestamps used by the stall watchdog: when a frame was last painted,
+    // and when bytes last arrived from the stream.
+    let lastFrameAt = 0;
+    let lastBytesAt = 0;
+
+    // --- Presentation ------------------------------------------------------
+    // RTSP packets arrive in bursts, so painting each frame the instant it
+    // decodes makes playback lurch even when no frames are lost. Decoded
+    // frames wait in a short queue and a display loop paints them at a steady
+    // cadence, which is what makes a native player look smooth.
+
+    // Decoded frames waiting to be shown. The buffer is what smooths out
+    // bursty RTSP delivery; see presentTick below.
+    const frameQueue = [];
+    // Decoded frames are large - 5.3MB each at 2560x1440 - and WebCodecs will
+    // not let many be outstanding at once, so this queue stays shallow. The
+    // real buffering happens before decode, on the compressed units, where the
+    // same number of frames costs a few hundred KB instead of ~180MB.
+    const MAX_QUEUE = 8;
+    // Presentation interval, measured from the stream rather than assumed:
+    // cameras vary (20fps here, but 15, 25 and 30 are all common) and a fixed
+    // rate would either starve the queue or let it drift into latency.
+    const DEFAULT_FRAME_INTERVAL_MS = 50;
+    let frameIntervalMs = DEFAULT_FRAME_INTERVAL_MS;
+    let presentTimer = null;
+
+    // The frame rate comes from ffmpeg, which reads it from the stream. It is
+    // not inferred from arrival times here: RTSP delivers frames in bursts, so
+    // measured gaps cluster near zero and any estimate comes out far too fast.
+    function setFrameRate(fps) {
+      if (!fps || fps < 1 || fps > 120) return;
+      const interval = 1000 / fps;
+      if (Math.abs(interval - frameIntervalMs) < 1) return;
+      frameIntervalMs = interval;
+      startPresenting();
+    }
+
+    function drawFrame(frame) {
+      // Size the backing store to the source once it is known, so the
+      // 2560x1440 stream is not resampled to a stale canvas size.
+      if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
+        canvas.width = frame.displayWidth;
+        canvas.height = frame.displayHeight;
+      }
+
+      frameQueue.push(frame);
+      // Bound the queue so a burst cannot turn into unbounded latency.
+      while (frameQueue.length > MAX_QUEUE) {
+        frameQueue.shift().close();
+      }
+    }
+
+    // Paint whenever a new frame is ready. requestAnimationFrame is not
+    // vsync-locked in this transparent frameless window - it was measured
+    // running at ~240Hz - so it is no use as a display clock. Painting on
+    // arrival, with only the newest frame held, keeps latency minimal and lets
+    // the decoder's own output cadence set the pace.
+    // Presenting on a steady clock instead of on arrival is what makes the
+    // picture smooth. RTSP delivers frames in bursts - measured gaps of over a
+    // second at ffmpeg's output on this camera - and painting each frame the
+    // moment it decodes turns that network jitter into visible stutter. A
+    // short buffer absorbs the bursts, at the cost of a little latency. This
+    // is what VLC does, and why VLC looks smooth on the same stream.
+    // Compressed access units waiting to be decoded. This is the real jitter
+    // buffer: cheap to hold (a few hundred KB) and deep enough to cover the
+    // ~1.7s stalls this camera produces. Its depth is the playback latency.
+    const unitQueue = [];
+    const TARGET_UNITS = 34;
+    const MAX_UNITS = 60;
+
+    // Target decoded-frame depth, kept small because decoded frames are large
+    // and WebCodecs limits how many can be outstanding.
+    const TARGET_QUEUE = 3;
+
+    // Playback waits for the buffer to fill before starting. Without this it
+    // begins on the first frame, runs dry immediately, and every stall shows
+    // through - the buffer only helps if it is actually full.
+    let priming = true;
+
+    function presentTick() {
+      // Wait for the buffer to fill before starting, or it runs dry at once
+      // and every stall shows through - the buffer only helps when full.
+      if (priming) {
+        if (unitQueue.length < TARGET_UNITS) return;
+        priming = false;
+      }
+
+      // Keep the decoder fed just enough to have a frame ready, no more.
+      while (frameQueue.length < TARGET_QUEUE && unitQueue.length > 0) {
+        if (!decodeNextUnit()) break;
+      }
+
+      // Hold the buffer near its target depth, but only just: changing
+      // Playback runs at a fixed rate. Varying it to manage buffer depth was
+      // tried and removed: changing playback speed is itself visible as jitter,
+      // and on a camera whose supply barely exceeds its frame rate the buffer
+      // cannot be refilled by slowing down anyway.
+
+      const frame = frameQueue.shift();
+      // Nothing ready: hold the last picture rather than showing nothing.
+      if (!frame) return;
+
+      ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+      frame.close();
+      // Recorded here rather than on decode, so the watchdog measures frames
+      // actually reaching the screen.
+      lastFrameAt = Date.now();
+    }
+
+    function startPresenting() {
+      if (presentTimer) clearInterval(presentTimer);
+      presentTimer = setInterval(presentTick, frameIntervalMs);
+    }
+
+    startPresenting();
+
+    function createDecoder() {
+      const dec = new VideoDecoder({
+        output: drawFrame,
+        error: (e) => {
+          console.error("Decoder error:", e);
+          // Rebuild on the next keyframe rather than staying wedged.
+          waitingForKeyframe = true;
+        },
+      });
+      // avc1.640028 = High profile, level 4.0, matching the camera's output.
+      // Annex-B elementary stream, so no description buffer is supplied.
+      dec.configure({
+        codec: "avc1.640028",
+        optimizeForLatency: true,
+      });
+      return dec;
+    }
+
+    // Locate Annex-B start codes and the NAL type that follows each one.
+    function scanNals(bytes) {
+      const nals = [];
+      let i = 0;
+      while (i + 3 < bytes.length) {
+        if (bytes[i] !== 0 || bytes[i + 1] !== 0) {
+          i++;
+          continue;
+        }
+        let offset;
+        if (bytes[i + 2] === 1) {
+          offset = i + 3;
+        } else if (bytes[i + 2] === 0 && bytes[i + 3] === 1) {
+          offset = i + 4;
+        } else {
+          i++;
+          continue;
+        }
+        if (offset < bytes.length) {
+          nals.push({ at: i, type: bytes[offset] & 0x1f });
+        }
+        i = offset;
+      }
+      return nals;
+    }
+
+    // Socket chunks do not align to frame boundaries, so bytes are accumulated
+    // and only whole access units are handed to the decoder.
+    let pending = new Uint8Array(0);
+    // Incoming chunks are held in a list and only joined when a complete
+    // access unit is ready. Concatenating on every socket message reallocated
+    // and copied the whole buffer each time, which cost several milliseconds
+    // per keyframe - those are ~255KB on this camera versus ~1KB for delta
+    // frames, so the burst landed as a visible hitch every couple of seconds.
+    const chunks = [];
+    let chunksLength = 0;
+    let frameCount = 0;
+
+    // Discard decoder and buffered bytes, e.g. when the source changes.
+    function resetDecoder() {
+      pending = new Uint8Array(0);
+      chunks.length = 0;
+      chunksLength = 0;
+      waitingForKeyframe = true;
+      if (decoder && decoder.state !== "closed") {
+        try { decoder.close(); } catch {}
+      }
+      decoder = null;
+      // Discard any held frame; it belongs to the stream being abandoned.
+      while (frameQueue.length) {
+        frameQueue.shift().close();
+      }
+      // Refill the buffer before showing anything.
+      unitQueue.length = 0;
+      priming = true;
+    }
+
+    function append(chunk) {
+      chunks.push(chunk);
+      chunksLength += chunk.length;
+    }
+
+    // Flatten the queued chunks into `pending` exactly once per feed cycle.
+    function collect() {
+      if (chunks.length === 0) return;
+      const merged = new Uint8Array(pending.length + chunksLength);
+      merged.set(pending, 0);
+      let offset = pending.length;
+      for (const c of chunks) {
+        merged.set(c, offset);
+        offset += c.length;
+      }
+      chunks.length = 0;
+      chunksLength = 0;
+      pending = merged;
+    }
+
+    function feedDecoder() {
+      collect();
+      const nals = scanNals(pending);
+      if (nals.length === 0) return;
+
+      // Determine where each access unit begins. A new picture starts at an
+      // SPS or at a slice NAL that follows a completed picture.
+      const boundaries = [];
+      let sawSlice = false;
+      for (const n of nals) {
+        const t = n.type;
+        if ((t === NAL_SPS || t === NAL_IDR || t === 1) && sawSlice) {
+          boundaries.push(n.at);
+          sawSlice = false;
+        }
+        if (t === NAL_IDR || t === 1) sawSlice = true;
+      }
+
+      // Everything up to the final boundary is complete; the tail may still be
+      // partial, so it stays buffered until more bytes arrive.
+      let consumed = 0;
+      for (const end of boundaries) {
+        const unit = pending.subarray(consumed, end);
+        emitUnit(unit);
+        consumed = end;
+      }
+      if (consumed > 0) {
+        pending = pending.slice(consumed);
+      }
+    }
+
+    // Parsed units are queued rather than decoded straight away. Holding them
+    // compressed is what absorbs bursty RTSP delivery without the memory cost
+    // of buffering decoded frames.
+    function emitUnit(unit) {
+      if (unit.length === 0) return;
+      const types = scanNals(unit).map((n) => n.type);
+      const isKeyframe = types.includes(NAL_IDR) || types.includes(NAL_SPS);
+
+      if (waitingForKeyframe) {
+        // Nothing before the first keyframe is decodable.
+        if (!isKeyframe) return;
+        waitingForKeyframe = false;
+      }
+
+      // Copy: `unit` is a view onto `pending`, which is about to be reused.
+      unitQueue.push({ data: unit.slice(), key: isKeyframe });
+
+      // If the queue overruns, drop forward to the next keyframe rather than
+      // letting latency grow without bound.
+      if (unitQueue.length > MAX_UNITS) {
+        const keyAt = unitQueue.findIndex((u, i) => i > 0 && u.key);
+        if (keyAt > 0) unitQueue.splice(0, keyAt);
+        else unitQueue.shift();
+      }
+    }
+
+    // Hand one unit to the decoder. Called on the presentation clock.
+    function decodeNextUnit() {
+      const next = unitQueue.shift();
+      if (!next) return false;
+
+      if (next.key && (!decoder || decoder.state !== "configured")) {
+        // Start clean so no stale reference frames survive a reconnect.
+        if (decoder && decoder.state !== "closed") {
+          try { decoder.close(); } catch {}
+        }
+        decoder = createDecoder();
+      }
+      if (!decoder || decoder.state !== "configured") return false;
+
+      try {
+        decoder.decode(new EncodedVideoChunk({
+          type: next.key ? "key" : "delta",
+          // The camera supplies no usable wall-clock timing here; a monotonic
+          // counter is enough to keep chunks ordered for the decoder.
+          timestamp: (frameCount++) * 1000,
+          data: next.data,
+        }));
+        return true;
+      } catch (e) {
+        console.error("Decode failed:", e);
+        waitingForKeyframe = true;
+        return false;
+      }
+    }
+
+    let ws = null;
+    // Bumped on every camera change so stale sockets cannot revive themselves.
+    let connectionEpoch = 0;
+
+    function connect() {
+      if (!viewCameraId) return;
+      const epoch = connectionEpoch;
+      const url = "ws://localhost:" + wsPort + "/" + encodeURIComponent(viewCameraId);
+      ws = new WebSocket(url);
+      ws.binaryType = "arraybuffer";
+
+      ws.onopen = () => {
+        statusDot.classList.add("connected");
+      };
+
+      ws.onmessage = (event) => {
+        lastBytesAt = Date.now();
+        append(new Uint8Array(event.data));
+        feedDecoder();
+      };
+
+      ws.onclose = () => {
+        statusDot.classList.remove("connected");
+        waitingForKeyframe = true;
+        pending = new Uint8Array(0);
+        // Retry so the view recovers on its own if ffmpeg or the camera blips,
+        // unless this socket belongs to a camera we have since switched away
+        // from.
+        if (epoch === connectionEpoch) {
+          setTimeout(connect, 1000);
+        }
+      };
+
+      ws.onerror = () => {
+        ws.close();
+      };
+    }
+
+    // Point this window at a different camera.
+    function switchTo(cameraId) {
+      if (cameraId === viewCameraId) return;
+      viewCameraId = cameraId;
+      connectionEpoch++;
+      resetDecoder();
+      if (ws) {
+        try { ws.close(); } catch {}
+        ws = null;
+      }
+      // Clear the last frame so the previous camera does not linger on screen.
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      connect();
+    }
+
+    // --- Connection status overlay -----------------------------------------
+    // Without this a failed connection is indistinguishable from a black
+    // frame, which is the hardest kind of problem for a user to report.
+
+    const messageEl = document.getElementById("message");
+    const headlineEl = document.getElementById("message-headline");
+    const detailEl = document.getElementById("message-detail");
+    const actionEl = document.getElementById("message-action");
+    const retryEl = document.getElementById("message-retry");
+
+    function showMessage(headline, detail, actionLabel, onAction, canRetry) {
+      headlineEl.textContent = headline;
+      detailEl.textContent = detail || "";
+      actionEl.textContent = actionLabel;
+      actionEl.onclick = onAction;
+      retryEl.style.display = canRetry ? "" : "none";
+      messageEl.classList.add("show");
+      container.classList.add("no-stream");
+    }
+
+    function hideMessage() {
+      messageEl.classList.remove("show");
+      container.classList.remove("no-stream");
+    }
+
+    const openSettings = () => {
+      if (window.electronAPI) window.electronAPI.openSettings();
+    };
+
+    retryEl.addEventListener("click", () => {
+      if (window.electronAPI) window.electronAPI.retryStream();
+    });
+
+    function applyStatus(status) {
+      if (!status) return;
+      switch (status.state) {
+        case "no-camera":
+          showMessage("No camera configured", "Add a camera to start viewing.", "Add a camera", openSettings, false);
+          break;
+        case "connecting":
+          showMessage("Connecting…", "", "Cameras", openSettings, false);
+          break;
+        case "streaming":
+          hideMessage();
+          break;
+        case "error":
+          showMessage("Cannot connect", status.detail, "Cameras", openSettings, true);
+          break;
+      }
+    }
+
+    if (window.electronAPI) {
+      window.electronAPI.onStreamStatus((status) => {
+        // Switching cameras restarts ffmpeg, so drop any buffered bytes and
+        // force a fresh decoder rather than mixing streams.
+        if (status.state === "connecting" && status.cameraId === viewCameraId) {
+          resetDecoder();
+        }
+        if (status.cameraId === viewCameraId && status.fps) {
+          setFrameRate(status.fps);
+        }
+        applyStatus(status);
+      });
+      window.electronAPI.getStreamStatus().then(applyStatus);
+    }
+
+    // Settings are reached from the camera menu's "Manage cameras…" row; a
+    // separate toolbar button was a second route to the same window.
+
+    // --- Camera picker -----------------------------------------------------
+    // Switching is a frequent action, so it lives in the overlay rather than
+    // behind the settings window.
+
+    const cameraButton = document.getElementById("camera-button");
+    const cameraMenu = document.getElementById("camera-menu");
+    const currentLabel = cameraButton.querySelector(".current");
+
+    const TICK = '<svg class="tick" xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>';
+    const GEAR = '<svg class="tick gear" xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>';
+
+    function closeMenu() {
+      cameraMenu.classList.remove("open");
+      container.classList.remove("menu-open");
+    }
+
+    function openMenu() {
+      cameraMenu.classList.add("open");
+      container.classList.add("menu-open");
+    }
+
+    async function refreshPicker() {
+      if (!window.electronAPI) return;
+      const { cameras, activeId } = await window.electronAPI.listCameras();
+
+      // A pop-out follows its own camera rather than the global selection.
+      const shownId = viewCameraId || activeId;
+      const active = cameras.find((c) => c.id === shownId);
+      currentLabel.textContent = active ? active.name : "No camera";
+
+      cameraMenu.innerHTML = "";
+      for (const cam of cameras) {
+        const item = document.createElement("button");
+        item.className = cam.id === shownId ? "active" : "";
+        item.innerHTML = TICK + '<span class="cam-name"></span>';
+        item.querySelector(".cam-name").textContent = cam.name;
+        item.addEventListener("click", async () => {
+          closeMenu();
+          if (cam.id !== viewCameraId) {
+            await window.electronAPI.selectCamera(cam.id);
+            switchTo(cam.id);
+            refreshPicker();
+          }
+        });
+        cameraMenu.appendChild(item);
+      }
+
+      if (cameras.length) {
+        const divider = document.createElement("div");
+        divider.className = "divider";
+        cameraMenu.appendChild(divider);
+      }
+
+      const manage = document.createElement("button");
+      // Gear in place of the checkmark column: this row is an action, not one
+      // of the cameras, so it reads differently while staying aligned.
+      manage.innerHTML = GEAR + '<span class="cam-name"></span>';
+      manage.querySelector(".cam-name").textContent =
+        cameras.length ? "Manage cameras…" : "Add a camera…";
+      manage.addEventListener("click", () => {
+        closeMenu();
+        openSettings();
+      });
+      cameraMenu.appendChild(manage);
+    }
+
+    cameraButton.addEventListener("click", (event) => {
+      event.stopPropagation();
+      if (cameraMenu.classList.contains("open")) {
+        closeMenu();
+      } else {
+        openMenu();
+      }
+    });
+
+    // Dismiss on any outside click or Escape.
+    document.addEventListener("click", closeMenu);
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") closeMenu();
+    });
+    cameraMenu.addEventListener("click", (event) => event.stopPropagation());
+
+    // --- Stall watchdog ----------------------------------------------------
+    // A decoder can wedge without ever firing its error callback, which leaves
+    // the last frame frozen on screen indefinitely. If bytes are still arriving
+    // but nothing has been painted for a while, rebuild the pipeline.
+
+    // Generous, because resetting is expensive: it throws away every frame
+    // until the next keyframe, which on this camera is up to 2 seconds of
+    // video. An earlier 8s threshold fired on healthy streams and was itself
+    // the cause of a stutter every few seconds.
+    const STALL_TIMEOUT_MS = 30000;
+
+    setInterval(() => {
+      // Nothing to do when this window is not showing a stream.
+      if (!viewCameraId || !ws || ws.readyState !== WebSocket.OPEN) return;
+      if (!lastFrameAt) return;
+
+      const now = Date.now();
+      // Only act when data is still arriving. A dead camera is the stream
+      // layer's problem and already surfaces as a connection error.
+      if (now - lastBytesAt > 5000) return;
+      // The decoder is only wedged if it is also not working through a queue.
+      if (decoder && decoder.decodeQueueSize > 0) return;
+      if (now - lastFrameAt < STALL_TIMEOUT_MS) return;
+
+      console.warn("No frames for", now - lastFrameAt, "ms - resetting decoder");
+      resetDecoder();
+      lastFrameAt = now;
+    }, 5000);
+
+    // Reflect edits made in the settings window (renames, additions, deletions).
+    if (window.electronAPI) {
+      window.electronAPI.onCamerasChanged(refreshPicker);
+    }
+
+    // --- Pop-out -----------------------------------------------------------
+
+    const btnPopout = document.getElementById("btn-popout");
+    btnPopout.addEventListener("click", () => {
+      if (window.electronAPI) window.electronAPI.popoutCamera(viewCameraId);
+    });
+
+    // Establish this window's identity, then connect. Pop-outs are dedicated
+    // to one camera, so they lose the picker and the pop-out button.
+    async function init() {
+      if (!window.electronAPI) return;
+      const ctxInfo = await window.electronAPI.getViewContext();
+      wsPort = ctxInfo.wsPort || 9999;
+      isPopout = ctxInfo.isPopout;
+
+      // Pop-outs are full viewers: same controls, same camera picker. The
+      // only difference is which window closing quits the app, which the
+      // main process decides.
+
+      // Adopt this window's camera before painting the picker, so each window
+      // labels itself correctly instead of showing the global selection.
+      if (ctxInfo.cameraId) switchTo(ctxInfo.cameraId);
+      await refreshPicker();
+    }
+
+    init();
+
+    // Snapshot
+    document.getElementById("btn-snapshot").addEventListener("click", () => {
+      const link = document.createElement("a");
+      link.download = "cam-" + new Date().toISOString().replace(/[:.]/g, "-") + ".png";
+      link.href = canvas.toDataURL("image/png");
+      link.click();
+    });
+
+    // Quit the app, saving every open window so the layout returns on the
+    // next launch. Routed through the main process rather than window.close(),
+    // which Chromium ignores for windows it did not script-open - so no
+    // close handler ran and window state was never saved.
+    document.getElementById("btn-close").addEventListener("click", () => {
+      if (window.electronAPI) window.electronAPI.closeWindow();
+    });
+
+    // Remove just this window, and forget it so it does not come back.
+    document.getElementById("btn-dismiss").addEventListener("click", () => {
+      if (window.electronAPI) window.electronAPI.dismissWindow();
+    });
+
+    document.getElementById("btn-minimize").addEventListener("click", () => {
+      if (window.electronAPI) window.electronAPI.minimizeWindow();
+    });
+
+    // Pin toggle: cycles top → bottom → normal → top
+    const levels = ["top", "bottom", "normal"];
+    const svgAttrs = 'xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"';
+    const levelIcons = {
+      top: `<svg ${svgAttrs}><path d="M12 17v5"/><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z"/></svg>`,
+      bottom: `<svg ${svgAttrs}><path d="M12 5v14"/><path d="m19 12-7 7-7-7"/></svg>`,
+      normal: `<svg ${svgAttrs}><path d="M21 9V6a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2v10c0 1.1.9 2 2 2h4"/><rect width="10" height="7" x="12" y="13" rx="2"/></svg>`,
+    };
+    let levelIndex = 0;
+    const btnPin = document.getElementById("btn-pin");
+
+    // Restore saved level on startup
+    if (window.electronAPI && window.electronAPI.getWindowLevel) {
+      window.electronAPI.getWindowLevel().then((saved) => {
+        const idx = levels.indexOf(saved);
+        if (idx !== -1) {
+          levelIndex = idx;
+          btnPin.innerHTML = levelIcons[saved];
+          btnPin.title = "Window: " + saved;
+        }
+      });
+    }
+
+    // Hover-raise toggle
+    btnPin.addEventListener("click", () => {
+      levelIndex = (levelIndex + 1) % levels.length;
+      const level = levels[levelIndex];
+      if (window.electronAPI) {
+        window.electronAPI.setWindowLevel(level);
+      }
+      btnPin.innerHTML = levelIcons[level];
+      btnPin.title = "Window: " + level;
+    });
+
+    // --- See-through toggle ------------------------------------------------
+
+    const btnTransparent = document.getElementById("btn-transparent");
+    const eyeIcon = `<svg ${svgAttrs}><path d="M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0"/><circle cx="12" cy="12" r="3"/></svg>`;
+    const eyeOffIcon = `<svg ${svgAttrs}><path d="M10.733 5.076a10.744 10.744 0 0 1 11.205 6.575 1 1 0 0 1 0 .696 10.747 10.747 0 0 1-1.444 2.49"/><path d="M14.084 14.158a3 3 0 0 1-4.242-4.242"/><path d="M17.479 17.499a10.75 10.75 0 0 1-15.417-5.151 1 1 0 0 1 0-.696 10.75 10.75 0 0 1 4.446-5.143"/><path d="m2 2 20 20"/></svg>`;
+
+    function applySeeThrough(on) {
+      container.classList.toggle("see-through", on);
+      btnTransparent.innerHTML = on ? eyeOffIcon : eyeIcon;
+      btnTransparent.title = "See-through: " + (on ? "on" : "off");
+    }
+
+    btnTransparent.addEventListener("click", () => {
+      const on = !container.classList.contains("see-through");
+      applySeeThrough(on);
+      if (window.electronAPI) window.electronAPI.setSeeThrough(on);
+    });
+
+    // Restore the saved state for this window.
+    if (window.electronAPI && window.electronAPI.getSeeThrough) {
+      window.electronAPI.getSeeThrough().then((saved) => {
+        if (saved) applySeeThrough(true);
+      });
+    }
+  </script>
+</body>
+</html>

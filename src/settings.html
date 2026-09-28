@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
+  <title>Camera Settings</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #ffffff;
+      --fg: #1c1c1e;
+      --muted: #6b6b70;
+      --border: #d8d8dc;
+      --field: #ffffff;
+      --accent: #0a66d0;
+      --accent-fg: #ffffff;
+      --danger: #c0392b;
+      --row-active: #e8f0fb;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #1e1e20;
+        --fg: #f2f2f4;
+        --muted: #9a9aa0;
+        --border: #3a3a3e;
+        --field: #2a2a2e;
+        --accent: #4c93f0;
+        --accent-fg: #08131f;
+        --danger: #ff6b5e;
+        --row-active: #26364a;
+      }
+    }
+    * { box-sizing: border-box; }
+    /* Labels and list rows are chrome; inputs stay selectable below. */
+    body {
+      user-select: none;
+      -webkit-user-select: none;
+    }
+    input, select {
+      user-select: text;
+      -webkit-user-select: text;
+    }
+    body {
+      margin: 0;
+      padding: 20px;
+      background: var(--bg);
+      color: var(--fg);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: 13px;
+    }
+    h1 { font-size: 15px; margin: 0 0 4px; }
+    p.sub { margin: 0 0 16px; color: var(--muted); }
+
+    .camera-list { display: flex; flex-direction: column; gap: 6px; margin-bottom: 16px; }
+    .camera-row {
+      display: flex; align-items: center; gap: 10px;
+      padding: 9px 11px;
+      border: 1px solid var(--border); border-radius: 7px;
+      cursor: pointer;
+    }
+    .camera-row.active { border-color: var(--accent); background: var(--row-active); }
+    .camera-row .name { font-weight: 600; }
+    .camera-row .addr { color: var(--muted); font-size: 12px; }
+    .camera-row .spacer { flex: 1; }
+    .camera-row .live {
+      font-size: 11px; padding: 2px 7px; border-radius: 20px;
+      background: var(--accent); color: var(--accent-fg);
+    }
+    .empty {
+      padding: 22px; text-align: center; color: var(--muted);
+      border: 1px dashed var(--border); border-radius: 8px; margin-bottom: 16px;
+    }
+
+    fieldset { border: 1px solid var(--border); border-radius: 8px; padding: 14px; margin: 0 0 14px; }
+    legend { padding: 0 6px; color: var(--muted); font-size: 12px; }
+    label { display: block; margin-bottom: 10px; }
+    label span { display: block; margin-bottom: 4px; color: var(--muted); font-size: 12px; }
+    input, select {
+      width: 100%; padding: 7px 9px;
+      border: 1px solid var(--border); border-radius: 6px;
+      background: var(--field); color: var(--fg);
+      font-size: 13px; font-family: inherit;
+    }
+    input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+    .grid { display: grid; grid-template-columns: 2fr 1fr; gap: 0 10px; }
+
+    .actions { display: flex; gap: 8px; align-items: center; }
+    button {
+      padding: 7px 14px; border-radius: 6px; border: 1px solid var(--border);
+      background: var(--field); color: var(--fg);
+      font-size: 13px; font-family: inherit; cursor: pointer;
+    }
+    button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); font-weight: 600; }
+    button.danger { color: var(--danger); }
+    button:disabled { opacity: 0.5; cursor: default; }
+    .actions .spacer { flex: 1; }
+
+    .status { margin-top: 14px; padding: 9px 11px; border-radius: 6px; font-size: 12px; display: none; }
+    .status.show { display: block; }
+    .status.error { background: rgba(192,57,43,0.12); color: var(--danger); }
+    .status.ok { background: rgba(10,102,208,0.12); color: var(--accent); }
+    .note { color: var(--muted); font-size: 11px; margin-top: 10px; }
+  </style>
+</head>
+<body>
+  <h1>Cameras</h1>
+  <p class="sub">Select a camera to view, or add a new one.</p>
+
+  <div id="camera-list" class="camera-list"></div>
+  <div id="empty" class="empty" style="display:none">No cameras yet. Add one below.</div>
+
+  <fieldset>
+    <legend id="form-legend">Add a camera</legend>
+    <label>
+      <span>Name</span>
+      <input id="f-name" type="text" placeholder="Front door">
+    </label>
+    <div class="grid">
+      <label>
+        <span>Address</span>
+        <input id="f-host" type="text" placeholder="192.168.1.55" autocomplete="off">
+      </label>
+      <label>
+        <span>Port</span>
+        <input id="f-port" type="number" value="554" min="1" max="65535">
+      </label>
+    </div>
+    <label>
+      <span>Stream path</span>
+      <input id="f-path" type="text" value="/stream1" placeholder="/stream1" autocomplete="off">
+    </label>
+    <div class="grid">
+      <label>
+        <span>Username</span>
+        <input id="f-user" type="text" autocomplete="off">
+      </label>
+      <label>
+        <span>Password</span>
+        <input id="f-pass" type="password" autocomplete="new-password">
+      </label>
+    </div>
+    <label>
+      <span>Connection</span>
+      <select id="f-transport">
+        <option value="tcp">TCP (recommended)</option>
+        <option value="udp">UDP (may cause artifacts)</option>
+      </select>
+    </label>
+
+    <div class="actions">
+      <button id="btn-save" class="primary">Add camera</button>
+      <button id="btn-cancel" style="display:none">Cancel</button>
+      <div class="spacer"></div>
+      <button id="btn-delete" class="danger" style="display:none">Delete</button>
+    </div>
+    <div class="note" id="keychain-note"></div>
+  </fieldset>
+
+  <div id="status" class="status"></div>
+
+  <script>
+    const api = window.electronAPI;
+    const $ = (id) => document.getElementById(id);
+
+    const listEl = $("camera-list");
+    const emptyEl = $("empty");
+    const statusEl = $("status");
+    const legendEl = $("form-legend");
+    const btnSave = $("btn-save");
+    const btnCancel = $("btn-cancel");
+    const btnDelete = $("btn-delete");
+
+    // id of the camera being edited; null means the form is adding a new one.
+    let editingId = null;
+    let existingHadPassword = false;
+
+    function showStatus(text, kind) {
+      statusEl.textContent = text;
+      statusEl.className = "status show " + (kind || "");
+    }
+    function clearStatus() {
+      statusEl.className = "status";
+    }
+
+    function resetForm() {
+      editingId = null;
+      existingHadPassword = false;
+      $("f-name").value = "";
+      $("f-host").value = "";
+      $("f-port").value = "554";
+      $("f-path").value = "/stream1";
+      $("f-user").value = "";
+      $("f-pass").value = "";
+      $("f-pass").placeholder = "";
+      $("f-transport").value = "tcp";
+      legendEl.textContent = "Add a camera";
+      btnSave.textContent = "Add camera";
+      btnCancel.style.display = "none";
+      btnDelete.style.display = "none";
+    }
+
+    function editCamera(cam) {
+      editingId = cam.id;
+      existingHadPassword = cam.hasPassword;
+      $("f-name").value = cam.name;
+      $("f-host").value = cam.host;
+      $("f-port").value = cam.port;
+      $("f-path").value = cam.pathname;
+      $("f-user").value = cam.username;
+      $("f-pass").value = "";
+      // Never echo the stored password; indicate only that one exists.
+      $("f-pass").placeholder = cam.hasPassword ? "•••••• (unchanged)" : "";
+      $("f-transport").value = cam.transport;
+      legendEl.textContent = "Edit camera";
+      btnSave.textContent = "Save changes";
+      btnCancel.style.display = "";
+      btnDelete.style.display = "";
+    }
+
+    async function refresh() {
+      const { cameras, activeId, keychainAvailable } = await api.listCameras();
+
+      $("keychain-note").textContent = keychainAvailable
+        ? "Passwords are encrypted using your operating system's secure storage."
+        : "Secure storage is unavailable on this system, so passwords cannot be saved. Cameras without a password will still work.";
+
+      listEl.innerHTML = "";
+      emptyEl.style.display = cameras.length ? "none" : "";
+
+      for (const cam of cameras) {
+        const row = document.createElement("div");
+        row.className = "camera-row" + (cam.id === activeId ? " active" : "");
+
+        const label = document.createElement("div");
+        const name = document.createElement("div");
+        name.className = "name";
+        name.textContent = cam.name;
+        const addr = document.createElement("div");
+        addr.className = "addr";
+        addr.textContent = cam.host + ":" + cam.port + cam.pathname;
+        label.appendChild(name);
+        label.appendChild(addr);
+
+        const spacer = document.createElement("div");
+        spacer.className = "spacer";
+
+        row.appendChild(label);
+        row.appendChild(spacer);
+
+        if (cam.id === activeId) {
+          const live = document.createElement("span");
+          live.className = "live";
+          live.textContent = "Viewing";
+          row.appendChild(live);
+        }
+
+        const edit = document.createElement("button");
+        edit.textContent = "Edit";
+        edit.addEventListener("click", (e) => {
+          e.stopPropagation();
+          editCamera(cam);
+        });
+        row.appendChild(edit);
+
+        // Clicking the row switches the live view to that camera.
+        row.addEventListener("click", async () => {
+          await api.selectCamera(cam.id);
+          refresh();
+        });
+
+        listEl.appendChild(row);
+      }
+    }
+
+    btnSave.addEventListener("click", async () => {
+      clearStatus();
+      const host = $("f-host").value.trim();
+      if (!host) {
+        showStatus("Enter the camera's address.", "error");
+        return;
+      }
+
+      const payload = {
+        id: editingId || undefined,
+        name: $("f-name").value.trim() || "Camera",
+        host,
+        port: Number($("f-port").value) || 554,
+        pathname: $("f-path").value.trim() || "/stream1",
+        username: $("f-user").value.trim(),
+        transport: $("f-transport").value,
+      };
+
+      // Only send a password when one was typed, so editing without
+      // retyping it leaves the stored password intact.
+      const typed = $("f-pass").value;
+      if (typed || !existingHadPassword) {
+        payload.password = typed;
+      }
+
+      const result = await api.saveCamera(payload);
+      if (!result.ok) {
+        showStatus(result.error || "Could not save the camera.", "error");
+        return;
+      }
+      resetForm();
+      await refresh();
+      showStatus("Camera saved.", "ok");
+    });
+
+    btnCancel.addEventListener("click", () => {
+      resetForm();
+      clearStatus();
+    });
+
+    btnDelete.addEventListener("click", async () => {
+      if (!editingId) return;
+      await api.deleteCamera(editingId);
+      resetForm();
+      await refresh();
+      showStatus("Camera deleted.", "ok");
+    });
+
+    // Surface connection failures here too, since this is where the user
+    // fixes the address or credentials.
+    api.onStreamStatus((status) => {
+      if (status.state === "error") {
+        showStatus(status.detail, "error");
+      } else if (status.state === "streaming") {
+        showStatus("Connected.", "ok");
+      }
+    });
+
+    // Stay in step when the camera is switched from the overlay picker.
+    if (api.onCamerasChanged) {
+      api.onCamerasChanged(refresh);
+    }
+
+    resetForm();
+    refresh();
+  </script>
+</body>
+</html>

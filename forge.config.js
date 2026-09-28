@@ -132,8 +132,9 @@ module.exports = {
     },
     {
       // macOS ships as a .zip: a .dmg maker needs macOS-only tooling.
+      // Windows also gets a portable .zip alongside the Squirrel installer.
       name: '@electron-forge/maker-zip',
-      platforms: ['darwin'],
+      platforms: ['darwin', 'win32'],
     },
     {
       name: '@electron-forge/maker-deb',
